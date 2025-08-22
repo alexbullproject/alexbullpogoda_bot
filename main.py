@@ -1,71 +1,39 @@
 import os
 import asyncio
-from typing import Optional, Dict, Any, List
-from datetime import datetime
 import json
-import pytz
+from typing import Optional, Dict, Any, List
 
+from datetime import datetime
+import pytz
 import aiohttp
+
 from aiogram import Bot, Dispatcher, types, F
 from aiogram.filters import CommandStart, Command
 from aiogram.enums.parse_mode import ParseMode
+from aiogram.enums.chat_member_status import ChatMemberStatus
 from aiogram.utils.keyboard import InlineKeyboardBuilder
-from aiogram.types import ReplyKeyboardMarkup, KeyboardButton
+
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
 from apscheduler.triggers.cron import CronTrigger
 from dotenv import load_dotenv
 
-# Загружаем .env (на будущее) и задаём токен явно
-from dotenv import load_dotenv
+# ================== ENV ==================
 load_dotenv(encoding="utf-8")
-BOT_TOKEN = os.getenv("BOT_TOKEN")  # ← вместо жестко прописанного токена
+BOT_TOKEN = os.getenv("BOT_TOKEN")
 
+# Канал (публичный username). Если оставишь как есть — используется @alexbullpogoda
+CHANNEL_ID = os.getenv("CHANNEL_USERNAME", "@alexbullpogoda")
+JOIN_URL   = f"https://t.me/{CHANNEL_ID.lstrip('@')}"
 
-# === Проверка подписки на канал ===
-from aiogram.enums import ChatMemberStatus
-
-CHANNEL_ID = "@alexbullpogoda"                # публичный канал
-JOIN_URL   = "https://t.me/alexbullpogoda"    # ссылка на канал
-
-async def is_subscribed(bot: Bot, user_id: int) -> bool:
-    try:
-        member = await bot.get_chat_member(CHANNEL_ID, user_id)
-        return member.status in {
-            ChatMemberStatus.MEMBER,
-            ChatMemberStatus.ADMINISTRATOR,
-            ChatMemberStatus.CREATOR,
-        }
-    except Exception:
-        return False
-
-async def require_subscription(message: types.Message, bot: Bot) -> bool:
-    if await is_subscribed(bot, message.from_user.id):
-        return True
-    kb = InlineKeyboardBuilder()
-    kb.button(text="✅ Подписаться на канал", url=JOIN_URL)
-    kb.button(text="🔄 Проверить подписку", callback_data="check_sub")
-    kb.adjust(1)
-    await message.answer(
-        "Функция доступна только подписчикам канала.\n"
-        "1) Подпишись на канал\n"
-        "2) Нажми «Проверить подписку» 👇",
-        reply_markup=kb.as_markup()
-    )
-    return False
-# === конец блока проверки подписки ===
-
+# Файлы состояния
 DATA_FILE = "data.json"
 
-# Runtime memory
-LAST_CITY: Dict[int, str] = {}              # user_id -> last query text
-PICK_OPTIONS: Dict[int, List[Dict[str, Any]]] = {}
+# ================== RUNTIME STATE ==================
+LAST_CITY: Dict[int, str] = {}                       # user_id -> last free-text
+PICK_OPTIONS: Dict[int, List[Dict[str, Any]]] = {}   # user_id -> geocoding options
+STATE: Dict[str, Any] = {"users": {}}                # persistent
 
-# Persistent user settings (храним в data.json)
-STATE: Dict[str, Any] = {"users": {}}
-
-GEOCODE_URL = "https://geocoding-api.open-meteo.com/v1/search"
-FORECAST_URL = "https://api.open-meteo.com/v1/forecast"
-
+# ================== HELP ==================
 HELP_TEXT = (
     "Пришлите название города (на русском или латиницей) — отвечу прогнозом на завтра.\n\n"
     "Команды:\n"
@@ -74,34 +42,11 @@ HELP_TEXT = (
     "• /repeat — повторить прогноз по последнему городу\n"
     "• /daily HH:MM — присылать прогноз каждый день в указанное время (вашего города)\n"
     "• /stop — остановить ежедневную рассылку\n"
-    "• /menu — показать клавиатуру\n"
 )
 
-def load_state():
-    global STATE
-    if os.path.exists(DATA_FILE):
-        try:
-            with open(DATA_FILE, "r", encoding="utf-8") as f:
-                STATE = json.load(f)
-        except Exception:
-            STATE = {"users": {}}
-
-def save_state():
-    tmp = DATA_FILE + ".tmp"
-    with open(tmp, "w", encoding="utf-8") as f:
-        json.dump(STATE, f, ensure_ascii=False, indent=2)
-    os.replace(tmp, DATA_FILE)
-
-def main_menu() -> ReplyKeyboardMarkup:
-    # Клавиатура с удобными кнопками
-    return ReplyKeyboardMarkup(
-        keyboard=[
-            [KeyboardButton(text="/daily 08:00"), KeyboardButton(text="/stop")],
-            [KeyboardButton(text="🌆 Сменить город"), KeyboardButton(text="/help")]
-        ],
-        resize_keyboard=True,
-        input_field_placeholder="Напишите город (например, Минск)..."
-    )
+# ================== OPEN-METEO ==================
+GEOCODE_URL  = "https://geocoding-api.open-meteo.com/v1/search"
+FORECAST_URL = "https://api.open-meteo.com/v1/forecast"
 
 async def geocode_city(session: aiohttp.ClientSession, query: str, count: int = 5) -> List[Dict[str, Any]]:
     params = {"name": query, "count": count, "language": "ru", "format": "json"}
@@ -163,10 +108,8 @@ def wmo_to_emoji(wmo: Optional[int]) -> str:
     if 95 <= wmo <= 99: return "⛈️"
     return "🌤️"
 
-def format_wind_dir(deg: Optional[float]) -> str:
-    # 16 румбов — полные русские названия
-    if deg is None:
-        return "Нет данных"
+def format_wind_dir_full(deg: Optional[float]) -> str:
+    if deg is None: return "Нет данных"
     names = [
         "Север", "Северо‑северо‑восток", "Северо‑восток", "Восток‑северо‑восток",
         "Восток", "Восток‑юго‑восток", "Юго‑восток", "Юго‑юго‑восток",
@@ -187,7 +130,7 @@ def format_city_label(geo: Dict[str, Any]) -> str:
 
 def format_forecast_text(city_label: str, tz: str, f: Dict[str, Any]) -> str:
     emoji = wmo_to_emoji(f["weathercode"])
-    wind_dir = format_wind_dir(f["wind_dir"])
+    wind_dir = format_wind_dir_full(f["wind_dir"])
     precip = f["precip_mm"]
     precip_line = f"Осадки: {precip:.1f} мм" if precip is not None else "Осадки: —"
     prob = f["precip_prob"]
@@ -203,6 +146,21 @@ def format_forecast_text(city_label: str, tz: str, f: Dict[str, Any]) -> str:
     ]
     return "\n".join(parts)
 
+def load_state():
+    global STATE
+    if os.path.exists(DATA_FILE):
+        try:
+            with open(DATA_FILE, "r", encoding="utf-8") as f:
+                STATE = json.load(f)
+        except Exception:
+            STATE = {"users": {}}
+
+def save_state():
+    tmp = DATA_FILE + ".tmp"
+    with open(tmp, "w", encoding="utf-8") as f:
+        json.dump(STATE, f, ensure_ascii=False, indent=2)
+    os.replace(tmp, DATA_FILE)
+
 def ensure_user(user_id: int) -> Dict[str, Any]:
     users = STATE.setdefault("users", {})
     u = users.get(str(user_id))
@@ -211,6 +169,34 @@ def ensure_user(user_id: int) -> Dict[str, Any]:
         users[str(user_id)] = u
     return u
 
+# ================== SUBSCRIPTION ==================
+async def is_subscribed(bot: Bot, user_id: int) -> bool:
+    try:
+        member = await bot.get_chat_member(CHANNEL_ID, user_id)
+        return member.status in {
+            ChatMemberStatus.MEMBER,
+            ChatMemberStatus.ADMINISTRATOR,
+            ChatMemberStatus.OWNER,
+        }
+    except Exception:
+        return False
+
+async def require_subscription(message: types.Message, bot: Bot) -> bool:
+    if await is_subscribed(bot, message.from_user.id):
+        return True
+    kb = InlineKeyboardBuilder()
+    kb.button(text="✅ Подписаться на канал", url=JOIN_URL)
+    kb.button(text="🔄 Проверить подписку", callback_data="check_sub")
+    kb.adjust(1)
+    await message.answer(
+        "Функция доступна только подписчикам канала.\n"
+        "1) Подпишись на канал\n"
+        "2) Нажми «Проверить подписку» 👇",
+        reply_markup=kb.as_markup()
+    )
+    return False
+
+# ================== ACTIONS ==================
 async def send_tomorrow_forecast(bot: Bot, user_id: int):
     user = ensure_user(user_id)
     if not user.get("lat"):
@@ -249,8 +235,7 @@ async def handle_city_query(message: types.Message, query: str):
         await message.answer("Не нашёл такой город. Попробуйте ещё раз (можно добавить страну: «Гродно, BY»).")
         return
     if len(results) == 1:
-        geo = results[0]
-        await apply_city_and_reply(message, geo)
+        await apply_city_and_reply(message, results[0])
         return
     PICK_OPTIONS[user_id] = results
     kb = InlineKeyboardBuilder()
@@ -265,7 +250,6 @@ async def apply_city_and_reply(message: types.Message, geo: Dict[str, Any]):
     label = format_city_label(geo)
     lat = float(geo["latitude"]); lon = float(geo["longitude"])
     tz = geo.get("timezone", "auto")
-
     user = ensure_user(user_id)
     user.update({"city_label": label, "lat": lat, "lon": lon, "tz": tz})
     save_state()
@@ -282,16 +266,47 @@ async def apply_city_and_reply(message: types.Message, geo: Dict[str, Any]):
     kb.adjust(1)
     await message.answer(text, parse_mode=ParseMode.MARKDOWN, reply_markup=kb.as_markup())
 
+# ================== WEBHOOK SERVER (Render Free) ==================
+from aiohttp import web
+from aiogram.webhook.aiohttp_server import SimpleRequestHandler, setup_application
+
+WEBHOOK_SECRET = os.getenv("WEBHOOK_SECRET", "secret123")
+BASE_URL = os.getenv("BASE_URL")  # пример: https://alexbullpogoda-bot.onrender.com
+WEBHOOK_PATH = f"/webhook/{WEBHOOK_SECRET}"
+
+async def on_startup(app: web.Application):
+    bot: Bot = app["bot"]
+    # Ставим вебхук только если BASE_URL уже указан (на первом старте может быть пусто)
+    if BASE_URL:
+        await bot.set_webhook(f"{BASE_URL}{WEBHOOK_PATH}")
+
+async def on_shutdown(app: web.Application):
+    bot: Bot = app["bot"]
+    try:
+        await bot.delete_webhook(drop_pending_updates=True)
+    except Exception:
+        pass
+
+def run_webhook(bot: Bot, dp: Dispatcher):
+    app = web.Application()
+    app["bot"] = bot
+    app.on_startup.append(on_startup)
+    app.on_shutdown.append(on_shutdown)
+
+    SimpleRequestHandler(dispatcher=dp, bot=bot).register(app, path=WEBHOOK_PATH)
+    setup_application(app, dp, bot=bot)
+    web.run_app(app, host="0.0.0.0", port=int(os.getenv("PORT", "10000")))
+
+# ================== MAIN ==================
 def main():
     if not BOT_TOKEN:
-        raise RuntimeError("Укажите BOT_TOKEN в .env")
+        raise RuntimeError("Укажите BOT_TOKEN в переменных окружения")
 
     load_state()
 
     bot = Bot(BOT_TOKEN)
     dp = Dispatcher()
 
-    # Планировщик
     scheduler = AsyncIOScheduler(timezone=pytz.UTC)
     scheduler.start()
 
@@ -300,26 +315,15 @@ def main():
         if not await require_subscription(m, bot):
             return
         await m.answer(
-            "Привет! 👋 Напишите название города (на русском тоже можно) — пришлю прогноз на завтра.\n\n" + HELP_TEXT,
-            reply_markup=main_menu()
+            "Привет! 👋 Напишите название города (на русском тоже можно) — пришлю прогноз на завтра.\n\n" + HELP_TEXT
         )
 
     @dp.message(Command("help"))
     async def help_cmd(m: types.Message):
-        if not await require_subscription(m, bot):
-            return
-        await m.answer(HELP_TEXT, reply_markup=main_menu())
-
-    @dp.message(Command("menu"))
-    async def menu_cmd(m: types.Message):
-        if not await require_subscription(m, bot):
-            return
-        await m.answer("Меню открыто. Выберите действие или напишите город:", reply_markup=main_menu())
+        await m.answer(HELP_TEXT)
 
     @dp.message(Command("repeat"))
     async def repeat_cmd(m: types.Message):
-        if not await require_subscription(m, bot):
-            return
         uid = m.from_user.id
         city = LAST_CITY.get(uid) or ensure_user(uid).get("city_label")
         if not city:
@@ -343,36 +347,34 @@ def main():
             return
         parts = m.text.strip().split()
         if len(parts) != 2 or ":" not in parts[1]:
-            await m.answer("Использование: /daily HH:MM\nНапример: /daily 08:30", reply_markup=main_menu())
+            await m.answer("Использование: /daily HH:MM\nНапример: /daily 08:30")
             return
         time_str = parts[1]
         uid = m.from_user.id
         user = ensure_user(uid)
         if not user.get("lat"):
-            await m.answer("Сначала выберите город: пришлите его название сообщением.", reply_markup=main_menu())
+            await m.answer("Сначала выберите город: пришлите его название сообщением.")
             return
         user["daily"] = {"time": time_str}
         save_state()
         schedule_daily(scheduler, bot, uid, time_str, user["tz"])
-        await m.answer(f"Готово! Буду присылать прогноз каждый день в {time_str} по вашему времени ({user['tz']}).", reply_markup=main_menu())
+        await m.answer(f"Готово! Буду присылать прогноз каждый день в {time_str} по вашему времени ({user['tz']}).")
 
     @dp.message(Command("stop"))
     async def stop_cmd(m: types.Message):
-        if not await require_subscription(m, bot):
-            return
         uid = m.from_user.id
         cancel_daily(scheduler, uid)
         user = ensure_user(uid)
         user.pop("daily", None)
         save_state()
-        await m.answer("Ежедневная рассылка отключена.", reply_markup=main_menu())
+        await m.answer("Ежедневная рассылка отключена.")
 
     @dp.callback_query(F.data == "check_sub")
-    async def cb_check_sub(c: types.CallbackQuery):
+    async def check_sub(c: types.CallbackQuery):
         if await is_subscribed(bot, c.from_user.id):
-            await c.message.answer("✅ Подписка подтверждена! Можешь пользоваться ботом.", reply_markup=main_menu())
+            await c.message.answer("✅ Подписка подтверждена! Теперь отправьте название города.")
         else:
-            await c.answer("Кажется, ты ещё не подписан 🤔", show_alert=True)
+            await c.answer("Не вижу подписку. Подпишись и нажми снова.", show_alert=True)
 
     @dp.callback_query(F.data.startswith("pick:"))
     async def pick_city(c: types.CallbackQuery):
@@ -407,20 +409,17 @@ def main():
         user["daily"] = {"time": t}
         save_state()
         schedule_daily(scheduler, bot, uid, t, user["tz"])
-        await c.message.answer(f"Подписал! Ежедневный прогноз в {t} по времени {user['tz']}.", reply_markup=main_menu())
+        await c.message.answer(f"Подписал! Ежедневный прогноз в {t} по времени {user['tz']}.")
         await c.answer()
 
     @dp.message(F.text)
     async def any_text(m: types.Message):
         if not await require_subscription(m, bot):
             return
-        text = m.text.strip()
-        if text == "🌆 Сменить город":
-            await m.answer("Ок, пришлите новый город сообщением (например, «Минск»).", reply_markup=main_menu())
-            return
-        await handle_city_query(m, text)
+        await handle_city_query(m, m.text.strip())
 
-    asyncio.run(dp.start_polling(bot))
+    # === WEBHOOK RUN (для Render Free) ===
+    run_webhook(bot, dp)
 
 if __name__ == "__main__":
     main()
