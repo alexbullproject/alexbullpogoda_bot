@@ -1,1 +1,6 @@
+aiogram==3.*
 aiohttp
+uvicorn
+APScheduler
+python-dotenv
+pytz
