@@ -1,1 +1,6 @@
-: aiogram==3.*; aiohttp; uvicorn[standard]; APScheduler; python-dotenv; pytz
+﻿aiogram==3.*
+aiohttp
+uvicorn[standard]
+APScheduler
+python-dotenv
+pytz
