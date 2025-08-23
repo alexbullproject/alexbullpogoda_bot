@@ -1,5 +1,6 @@
-aiogram
+aiogram==3.*
 aiohttp
+uvicorn[standard]
+APScheduler
 python-dotenv
-requests
 pytz
